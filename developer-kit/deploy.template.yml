@@ -26,7 +26,11 @@ on:
 
 jobs:
   deploy:
-    uses: OpalaDev/opala-platform/.github/workflows/opala-deploy.yml@main
+    uses: vikramopala/opala-aks-demo/.github/workflows/opala-deploy.yml@main
+    # Required for OIDC Azure login — do not remove
+    permissions:
+      id-token: write
+      contents: read
     with:
       app_name:    "your-app-name"    # ← change: lowercase, hyphens only e.g. "my-api"
       app_port:    8000               # ← change: port your app listens on
