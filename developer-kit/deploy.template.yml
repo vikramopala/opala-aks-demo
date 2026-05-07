@@ -1,0 +1,35 @@
+# ============================================================
+# OPALA DEPLOY TEMPLATE
+# ------------------------------------------------------------
+# 1. Copy this file to your repo at:
+#      .github/workflows/deploy.yml
+#
+# 2. Edit ONLY the 3 lines marked with  ← change this
+#
+# 3. Push to main — your app deploys automatically.
+#    Check the Actions tab for the public URL.
+# ============================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, stg, tst, prd]
+        default: dev
+
+jobs:
+  deploy:
+    uses: OpalaDev/opala-platform/.github/workflows/opala-deploy.yml@main
+    with:
+      app_name:    "your-app-name"    # ← change: lowercase, hyphens only e.g. "my-api"
+      app_port:    8000               # ← change: port your app listens on
+      replicas:    2                  # ← optional: number of pods (default: 2)
+      environment: ${{ inputs.environment || 'dev' }}
+    secrets: inherit
