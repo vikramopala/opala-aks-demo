@@ -1,0 +1,185 @@
+# ============================================================
+# Opala Reusable Deploy Workflow — AKS
+# ------------------------------------------------------------
+# Hosted in: OpalaDev/opala-platform  (.github/workflows/)
+# Called by: any app repo via workflow_call
+#
+# Auth: OIDC federated credentials (no client secret stored)
+#       Uses the same AZURE_TENANT_ID / SUBSCRIPTION_ID /
+#       CLIENT_ID pattern as all other Opala workflows.
+#
+# What it does automatically:
+#   1. Builds Docker image via az acr build
+#   2. Pushes to opalaacr.azurecr.io
+#   3. Ensures ACR pull secret exists in AKS
+#   4. Creates or updates the Kubernetes Deployment
+#   5. Exposes via LoadBalancer (first deploy only)
+#   6. Waits for rollout and prints the public URL
+# ============================================================
+
+name: Opala — Build & Deploy to AKS
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App name (lowercase, hyphens OK). Used as image name and k8s deployment name."
+        required: true
+        type: string
+      app_port:
+        description: "Port the container listens on."
+        required: true
+        type: number
+      replicas:
+        description: "Number of pod replicas."
+        required: false
+        type: number
+        default: 2
+      image_tag:
+        description: "Docker image tag. Defaults to git SHA."
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "Target environment: dev | stg | tst | prd"
+        required: false
+        type: string
+        default: "dev"
+
+    outputs:
+      public_url:
+        description: "Public URL of the deployed app."
+        value: ${{ jobs.deploy.outputs.public_url }}
+
+# ── Shared Opala AKS / ACR config ───────────────────────────
+env:
+  ACR_NAME: opalaacr
+  ACR_SERVER: opalaacr.azurecr.io
+  RESOURCE_GROUP: fastapi-rg
+  AKS_CLUSTER: fastapi-aks
+
+jobs:
+  deploy:
+    name: "Deploy · ${{ inputs.app_name }} · ${{ inputs.environment }}"
+    runs-on:
+      group: ubuntu-runners
+    environment: ${{ inputs.environment }}
+
+    # Required for OIDC login — matches all other Opala workflows
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      public_url: ${{ steps.get-url.outputs.public_url }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Resolve image tag ─────────────────────────────
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.sha }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "image=${{ env.ACR_SERVER }}/${{ inputs.app_name }}:$TAG" >> $GITHUB_OUTPUT
+
+      # ── 3. Azure OIDC login (same as all Opala workflows) ─
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+
+      # ── 4. Build & push to opalaacr ──────────────────────
+      - name: Build & push to opalaacr
+        run: |
+          az acr build \
+            --registry ${{ env.ACR_NAME }} \
+            --image ${{ inputs.app_name }}:${{ steps.tag.outputs.tag }} \
+            .
+          echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ steps.tag.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
+
+      # ── 5. Set AKS kubectl context ───────────────────────
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name:   ${{ env.AKS_CLUSTER }}
+
+      # ── 6. Ensure ACR pull secret in cluster ─────────────
+      - name: Ensure ACR pull secret
+        run: |
+          ACR_USER=$(az acr credential show --name ${{ env.ACR_NAME }} --query username -o tsv)
+          ACR_PASS=$(az acr credential show --name ${{ env.ACR_NAME }} --query "passwords[0].value" -o tsv)
+          kubectl create secret docker-registry opala-acr-pull-secret \
+            --docker-server=${{ env.ACR_SERVER }} \
+            --docker-username="$ACR_USER" \
+            --docker-password="$ACR_PASS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ── 7. Deploy or update on AKS ───────────────────────
+      - name: Deploy to AKS
+        run: |
+          APP="${{ inputs.app_name }}"
+          IMAGE="${{ steps.tag.outputs.image }}"
+
+          if kubectl get deployment "$APP" > /dev/null 2>&1; then
+            echo "Updating existing deployment: $APP"
+            kubectl set image deployment/$APP $APP=$IMAGE
+          else
+            echo "Creating new deployment: $APP"
+            kubectl create deployment $APP \
+              --image=$IMAGE \
+              --replicas=${{ inputs.replicas }}
+          fi
+
+          # Attach pull secret
+          kubectl patch deployment $APP --patch "{
+            \"spec\": {\"template\": {\"spec\": {
+              \"imagePullSecrets\": [{\"name\": \"opala-acr-pull-secret\"}]
+            }}}
+          }"
+
+          # Expose via LoadBalancer on first deploy
+          if ! kubectl get svc "$APP" > /dev/null 2>&1; then
+            kubectl expose deployment $APP \
+              --type=LoadBalancer \
+              --port=80 \
+              --target-port=${{ inputs.app_port }}
+          fi
+
+          # Scale to desired replicas
+          kubectl scale deployment $APP --replicas=${{ inputs.replicas }}
+
+          # Wait for rollout to complete
+          kubectl rollout status deployment/$APP --timeout=120s
+
+      # ── 8. Get public URL ────────────────────────────────
+      - name: Get public URL
+        id: get-url
+        run: |
+          APP="${{ inputs.app_name }}"
+          for i in $(seq 1 20); do
+            IP=$(kubectl get svc $APP \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+            if [ -n "$IP" ]; then
+              echo "public_url=http://$IP" >> $GITHUB_OUTPUT
+              echo "### Deployment complete" >> $GITHUB_STEP_SUMMARY
+              echo "| | |" >> $GITHUB_STEP_SUMMARY
+              echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+              echo "| **App** | \`$APP\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Environment** | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Image** | \`${{ steps.tag.outputs.image }}\` |" >> $GITHUB_STEP_SUMMARY
+              echo "| **URL** | http://$IP |" >> $GITHUB_STEP_SUMMARY
+              echo "| **Docs** | http://$IP/docs |" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            echo "Waiting for IP... ($i/20)"
+            sleep 6
+          done

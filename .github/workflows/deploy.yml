@@ -1,0 +1,30 @@
+# ============================================================
+# App deploy — edit ONLY the `with:` block below.
+# All deployment logic is in OpalaDev/opala-platform.
+# ============================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, stg, tst, prd]
+        default: dev
+
+jobs:
+  deploy:
+    uses: OpalaDev/opala-platform/.github/workflows/opala-deploy.yml@main
+    # ── Edit these 3 lines for your app ──────────────────
+    with:
+      app_name:    "sample-fastapi-app"
+      app_port:    8000
+      replicas:    2
+      environment: ${{ inputs.environment || 'dev' }}
+    # ── Secrets come from the GitHub environment (OIDC) ──
+    secrets: inherit
