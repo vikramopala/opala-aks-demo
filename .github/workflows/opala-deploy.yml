@@ -45,6 +45,23 @@ on:
         required: false
         type: string
         default: "dev"
+      health_path:
+        description: "Kubernetes liveness/readiness probe path. Default: /health"
+        required: false
+        type: string
+        default: "/health"
+      key_vault_name:
+        description: "Azure Key Vault name to fetch build-time secrets from (optional)."
+        required: false
+        type: string
+        default: ""
+      kv_build_args:
+        description: >
+          Comma-separated list of  KV-secret-name=DOCKER_ARG_NAME  mappings.
+          Example: 'entra-tenant-id=VITE_ENTRA_TENANT_ID,api-base-url=VITE_API_BASE_URL'
+        required: false
+        type: string
+        default: ""
 
     outputs:
       public_url:
@@ -95,24 +112,44 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
 
-      # ── 4. Build & push to opalaacr ──────────────────────
+      # ── 4. Fetch Key Vault build-time secrets (optional) ─
+      - name: Fetch KV build args
+        id: kv-args
+        if: inputs.key_vault_name != '' && inputs.kv_build_args != ''
+        run: |
+          BUILD_ARGS=""
+          IFS=',' read -ra PAIRS <<< "${{ inputs.kv_build_args }}"
+          for PAIR in "${PAIRS[@]}"; do
+            KV_SECRET="${PAIR%%=*}"
+            ARG_NAME="${PAIR##*=}"
+            VALUE=$(az keyvault secret show \
+              --vault-name "${{ inputs.key_vault_name }}" \
+              --name "$KV_SECRET" \
+              --query value -o tsv)
+            echo "::add-mask::$VALUE"
+            BUILD_ARGS="$BUILD_ARGS --build-arg $ARG_NAME=$VALUE"
+          done
+          echo "build_args=$BUILD_ARGS" >> $GITHUB_OUTPUT
+
+      # ── 5. Build & push to opalaacr ──────────────────────
       - name: Build & push to opalaacr
         run: |
           az acr build \
             --registry ${{ env.ACR_NAME }} \
             --image ${{ inputs.app_name }}:${{ steps.tag.outputs.tag }} \
+            ${{ steps.kv-args.outputs.build_args }} \
             .
           echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
           echo "\`${{ steps.tag.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
 
-      # ── 5. Set AKS kubectl context ───────────────────────
+      # ── 6. Set AKS kubectl context ───────────────────────
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
           resource-group: ${{ env.RESOURCE_GROUP }}
           cluster-name:   ${{ env.AKS_CLUSTER }}
 
-      # ── 6. Ensure ACR pull secret in cluster ─────────────
+      # ── 7. Ensure ACR pull secret in cluster ─────────────
       - name: Ensure ACR pull secret
         run: |
           ACR_USER=$(az acr credential show --name ${{ env.ACR_NAME }} --query username -o tsv)
@@ -123,11 +160,12 @@ jobs:
             --docker-password="$ACR_PASS" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # ── 7. Deploy or update on AKS ───────────────────────
+      # ── 8. Deploy or update on AKS ───────────────────────
       - name: Deploy to AKS
         run: |
           APP="${{ inputs.app_name }}"
           IMAGE="${{ steps.tag.outputs.image }}"
+          PORT="${{ inputs.app_port }}"
 
           if kubectl get deployment "$APP" > /dev/null 2>&1; then
             echo "Updating existing deployment: $APP"
@@ -157,10 +195,19 @@ jobs:
           # Scale to desired replicas
           kubectl scale deployment $APP --replicas=${{ inputs.replicas }}
 
+          # Patch liveness + readiness probes with the app's health path
+          kubectl patch deployment $APP --patch "{
+            \"spec\": {\"template\": {\"spec\": {\"containers\": [{
+              \"name\": \"$APP\",
+              \"livenessProbe\":  {\"httpGet\": {\"path\": \"${{ inputs.health_path }}\", \"port\": $PORT}, \"initialDelaySeconds\": 10, \"periodSeconds\": 15},
+              \"readinessProbe\": {\"httpGet\": {\"path\": \"${{ inputs.health_path }}\", \"port\": $PORT}, \"initialDelaySeconds\": 5,  \"periodSeconds\": 10}
+            }]}}}}
+          "
+
           # Wait for rollout to complete
           kubectl rollout status deployment/$APP --timeout=120s
 
-      # ── 8. Get public URL ────────────────────────────────
+      # ── 9. Get public URL ────────────────────────────────
       - name: Get public URL
         id: get-url
         run: |
