@@ -63,6 +63,17 @@ on:
         type: string
         default: ""
 
+    secrets:
+      AZURE_CLIENT_ID:
+        description: "Managed identity client ID for OIDC login"
+        required: true
+      AZURE_TENANT_ID:
+        description: "Azure AD tenant ID"
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: "Azure subscription ID"
+        required: true
+
     outputs:
       public_url:
         description: "Public URL of the deployed app."
