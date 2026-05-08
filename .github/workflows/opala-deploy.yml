@@ -80,7 +80,9 @@ jobs:
     name: "Deploy · ${{ inputs.app_name }} · ${{ inputs.environment }}"
     runs-on:
       group: ubuntu-runners
-    environment: ${{ inputs.environment }}
+    # environment is intentionally NOT set here — secrets come from the
+    # caller via secrets: inherit. The caller declares its own environment
+    # so GitHub loads the right env secrets before passing them through.
 
     # Required for OIDC login — matches all other Opala workflows
     permissions:
